@@ -1,0 +1,378 @@
+//multi-biome generation blended 
+//individual noise octave settings
+
+//no terrain textures
+//no terrian assets(no trees, rocks, etc)
+//was in the middle of adding citys/town connected with highways between chunks (chunks not implemented)  
+
+//dependencies aren't all used
+
+using UnityEngine;
+using System.Collections.Generic;
+using System.Collections;
+using System.Runtime.InteropServices.WindowsRuntime;
+using System;
+using Unity.VisualScripting;
+using UnityEditor.Experimental.GraphView;
+using UnityEngine.Rendering;
+using UnityEngine.UIElements;
+using Unity.Mathematics;
+using static TerrainGeneration;
+using System.Net.NetworkInformation;
+using UnityEngine.XR;
+using System.Diagnostics;
+using JetBrains.Annotations;
+
+[RequireComponent(typeof(MeshFilter))]
+public class TerrainGeneration : MonoBehaviour
+{
+    public enum NormalizeMode { Local, Global };
+    public enum TextureMode { colour, height };
+    public TextureMode textureMode;
+
+    public OCTAVE_SETTINGS[] settings;
+    public WORLD_SETTINGS world;
+    public BIOME_GENERATION[] biome;
+    public BIOME_SETTINGS biomeSettings;
+    MESH_DATA meshData;
+    BIOME_DATA biomeData;
+
+    Mesh mesh;
+    MeshFilter Mfilter;
+    MeshRenderer Mrenderer;
+
+    float noiseHeight = 0f;
+    private Texture2D noiseTex;
+
+    public bool flatCheck;
+    public Renderer TextureRender;
+    public float falloffFactor;
+
+    public void Start()
+    {
+        TerrainInitiliser();
+    }
+
+    public void OnValidate()
+    {
+        TerrainInitiliser();
+    }
+    public void TerrainInitiliser()
+    {
+        meshData = new MESH_DATA(world.SizeX, world.SizeY);
+        biomeData = new BIOME_DATA(world.SizeX, world.SizeY);
+
+        BiomeGeneration();
+        MeshDataGenerator();
+        TriangleGenerator();
+
+        mesh = new Mesh();
+        GetComponent<MeshFilter>().mesh = mesh;
+
+        mesh = MeshGenerator();
+    }
+    void GenerateHeightmap(float[,] sample)
+    {
+        noiseTex = new Texture2D(world.SizeX, world.SizeY);
+        Color[] pix = new Color[world.SizeX * world.SizeY];
+
+        for (int y = 0; y < world.SizeY; y++)
+        {
+            for (int x = 0; x < world.SizeX; x++)
+            {
+                pix[y * world.SizeX + x] = Color.Lerp(Color.black, Color.white, sample[x,y]);
+            }
+        }
+
+        noiseTex.SetPixels(pix);
+        noiseTex.Apply();
+
+        TextureRender.sharedMaterial.mainTexture = noiseTex;
+        if(flatCheck == true)
+            TextureRender.transform.localScale = new Vector3(world.SizeX, 1, world.SizeY);
+        else
+            TextureRender.transform.localScale = new Vector3(1, 1, 1);
+    }
+    void GenerateColourMap(Color[] colourTex)
+    {
+        Texture2D texture = new Texture2D(world.SizeX, world.SizeY);
+        texture.filterMode = FilterMode.Point;
+        texture.wrapMode = TextureWrapMode.Clamp;
+        texture.SetPixels(colourTex);
+        texture.Apply();
+
+        TextureRender.sharedMaterial.mainTexture = texture;
+        if (flatCheck == true)
+            TextureRender.transform.localScale = new Vector3(world.SizeX, 1, world.SizeY);
+        else
+            TextureRender.transform.localScale = new Vector3(1, 1, 1);
+    }
+    public MESH_DATA MeshDataGenerator()
+    {
+        System.Random prng = new System.Random(world.seed);
+        Vector2[] octaveOffsets = new Vector2[settings.Length];
+        float maxPossibleHeight = 0;
+        float amplitude = 0.5f;
+
+        float halfWidth = world.SizeX / 2f;
+        float halfHeight = world.SizeY / 2f;
+        float maxNoiseHeight = float.MinValue;
+        float minNoiseHeight = float.MaxValue;
+
+        float[,] NoiseHeightMap = new float[world.SizeX + 1, world.SizeY + 1];
+
+        for (int o = 0; o < settings.Length; o++)
+        {
+            float offsetX = prng.Next(-100000, 100000) + settings[o].seedOffset.x;
+            float offsetY = prng.Next(-100000, 100000) - settings[o].seedOffset.y;
+            octaveOffsets[o] = new Vector2(offsetX, offsetY);
+
+            maxPossibleHeight += amplitude;
+            amplitude *= settings[o].persistance;
+        }
+
+        for (int i = 0, x = 0; x <= world.SizeX; x++)
+        {
+            for (int y = 0; y <= world.SizeY; y++)
+            {
+                //SAFE CLAMP
+                int safeX = Mathf.Min(x, world.SizeX - 1); // Clamp the x and y values to prevent out of bounds access
+                int safeY = Mathf.Min(y, world.SizeY - 1);
+
+                //BIOME VALUES
+                float rawTemp = biomeData.tempNoiseMap[x, y];
+                float rawHum = biomeData.humNoiseMap[x, y];
+
+                float elevationFactor = Mathf.Lerp(1.2f, 0.8f, rawTemp); // Use a neutral value or a fixed height approximation
+                float tempHeight = rawTemp;
+                float humHeight = rawHum;
+
+                float totalWeight = 0f;
+                noiseHeight = 0f;
+                Color blendedColor = Color.black;
+
+                for (int b = 0; b < biome.Length; b++)
+                {
+                    float tempDist = Mathf.Abs(tempHeight - biome[b].Temperature);
+                    float humDist = Mathf.Abs(humHeight - biome[b].Humidity);
+
+                    float tempWeight = 0.25f; // more influence
+                    float humWeight = 1.0f;  // less influence
+
+                    float dist = Mathf.Abs(tempDist) * tempWeight + Mathf.Abs(humDist) * humWeight;
+                    float weight = Mathf.Exp(-dist * falloffFactor);
+                    totalWeight += weight;
+
+                    amplitude = 0.5f;
+                    float frequency = 1f;
+                    float localNoise = 0f;
+                    float e = 2.56f;
+
+                    for (int o = 0; o < settings.Length; o++)
+                    {
+                        float sampleX = (x + world.offset.x + octaveOffsets[o].x) / settings[o].noiseScale * frequency;
+                        float sampleY = (y + world.offset.y + octaveOffsets[o].y) / settings[o].noiseScale * frequency;
+
+                        float baseNoise = Mathf.PerlinNoise(sampleX * e, sampleY * e);
+                        float adjusted = biome[b].Continentals.Evaluate(settings[o].curve.Evaluate(baseNoise)) * 2f - 1f;
+                        float amplified = blendedRidgeNoise(x, y, adjusted, biome[b].PeaksNValleys);
+                        localNoise += amplified * amplitude;
+
+                        e *= biome[b].erosion;
+                        amplitude *= settings[o].persistance;
+                        frequency *= settings[o].lacunarity;
+                    }
+
+                    noiseHeight += localNoise * weight;
+                    blendedColor += biome[b].colour * weight;
+                }
+
+                noiseHeight /= totalWeight;
+                blendedColor /= totalWeight;
+
+                if (noiseHeight > maxNoiseHeight) maxNoiseHeight = noiseHeight;
+                else if (noiseHeight < minNoiseHeight) minNoiseHeight = noiseHeight;
+
+                NoiseHeightMap[x, y] = noiseHeight;
+
+                if (world.normalizeMode == NormalizeMode.Global)
+                {
+                    float normalizedHeight = (NoiseHeightMap[x, y] + 1) / (maxPossibleHeight / 0.9f);
+                    NoiseHeightMap[x, y] = Mathf.Clamp(normalizedHeight, 0, int.MaxValue);
+                }
+
+                meshData.Vertices[i] = new Vector3(x - halfWidth, noiseHeight, y - halfHeight);
+                meshData.UVs[i] = new Vector2(x / (float)world.SizeX, y / (float)world.SizeY);
+                biomeData.colourTex[safeY * world.SizeX + safeX] = blendedColor;
+                i++;
+            }
+        }
+
+        if (world.normalizeMode == NormalizeMode.Local)
+        {
+            for (int y = 0; y < world.SizeY; y++)
+            {
+                for (int x = 0; x < world.SizeX; x++)
+                {
+                    NoiseHeightMap[x, y] = Mathf.InverseLerp(minNoiseHeight, maxNoiseHeight, NoiseHeightMap[x, y]);
+                }
+            }
+        }
+
+        if (textureMode == TextureMode.colour)
+            GenerateColourMap(biomeData.colourTex);
+        else if (textureMode == TextureMode.height)
+            GenerateHeightmap(NoiseHeightMap);
+        return meshData;
+    }
+
+    public int[] TriangleGenerator()
+    {
+        int tris = 0;
+        int verts = 0;
+
+        for (int row = 0; row < world.SizeX; row++)
+        {
+            for (int column = 0; column < world.SizeY; column++)
+            {
+                meshData.Triangles[tris + 0] = (verts + 1);
+                meshData.Triangles[tris + 1] = meshData.Triangles[tris + 3] = (verts + world.SizeX + 2); //tri 1 n 3 same
+                meshData.Triangles[tris + 2] = meshData.Triangles[tris + 5] = (verts); //tri 2 n 5 same
+                meshData.Triangles[tris + 4] = (verts + world.SizeX + 1);
+
+                tris += 6;
+                verts++;
+            }
+            verts++;
+        }
+
+        return meshData.Triangles;
+    }
+    public Mesh MeshGenerator()
+    {
+        mesh.Clear();
+        mesh.vertices = meshData.Vertices;
+        mesh.triangles = meshData.Triangles;
+        mesh.uv = meshData.UVs;
+        mesh.RecalculateNormals();
+        mesh.RecalculateTangents();
+        GetComponent<MeshCollider>().sharedMesh = mesh;
+
+        return mesh;
+    }
+
+    public BIOME_DATA BiomeGeneration()
+    {
+        System.Random prng = new System.Random(biomeSettings.seed);
+        Vector2 octaveOffsets;
+
+        float offsetX = prng.Next(-100000, 100000) + biomeSettings.seedOffset.x;
+        float offsetY = prng.Next(-100000, 100000) - biomeSettings.seedOffset.y;
+        octaveOffsets = new Vector2(offsetX, offsetY);
+
+        for (int i = 0, x = 0; x <= world.SizeX; x++)
+        {
+            for (int y = 0; y <= world.SizeY; y++)
+            {
+                float tempNoise = Mathf.PerlinNoise((x + octaveOffsets.x) / biomeSettings.tempScale, (y + octaveOffsets.y) / biomeSettings.tempScale);  // Temperature
+                float humNoise = Mathf.PerlinNoise((x + octaveOffsets.x) / biomeSettings.humScale, (y + octaveOffsets.y) / biomeSettings.humScale); // Humidity
+
+                tempNoise *= tempNoise - meshData.Vertices[i].y;
+
+                tempNoise = Mathf.Clamp01(tempNoise);
+                humNoise = Mathf.Clamp01(humNoise);
+
+                biomeData.tempNoiseMap[x, y] = tempNoise;
+                biomeData.humNoiseMap[x, y] = humNoise;
+                i++;
+            }
+        }
+
+        return biomeData;
+        //cool way for genreating lakes and rivers 
+
+        //float normalizedHeight = (tempNoiseMap[x, y] + 1) / (maxPossibleHeight / 0.1f);
+        //tempNoiseMap[x, y] = Mathf.Clamp(normalizedHeight, biome[0].Continentals.Evaluate(noiseHeight), int.MaxValue);
+    }
+
+    float blendedRidgeNoise(float x, float y, float noiseMap, float sharpness)
+    {
+        float ridge = 2 * (0.5f - Mathf.Abs(0.5f - noiseMap));
+
+        // Normalize sharpness to 0-1 range for lerping
+        float blend = Mathf.Clamp01((sharpness - 1) / 4); // Assuming sharpness range of 1 - 5
+
+        return noiseMap + (ridge * blend);
+    }
+
+    [System.Serializable]
+    public class OCTAVE_SETTINGS
+    {
+        public string Octavename;
+        public float noiseScale;
+        public float persistance;
+        public float lacunarity;
+        public AnimationCurve curve;
+        public Vector2 seedOffset;
+    }
+    [System.Serializable]
+    public class BIOME_GENERATION
+    {
+        public string BiomeName;
+        public Color colour;
+
+        public AnimationCurve Continentals;
+        public float Temperature;
+        public float Humidity;
+        [Range(1,5)]
+        public float PeaksNValleys;
+        public float erosion;
+        public float EXPONENT;
+    }
+    [System.Serializable]
+    public class BIOME_SETTINGS
+    {
+        public int seed;
+        public Vector2 seedOffset;
+
+        public float tempScale; //temperature ... the size of the scales will be proportional with the scale of the biomes
+        public float humScale; //humidity
+    }
+    [System.Serializable]
+    public class WORLD_SETTINGS
+    {
+        public TerrainGeneration.NormalizeMode normalizeMode;
+        public int seed;
+        public Vector2 offset;
+        public int SizeX = 50;
+        public int SizeY = 50;
+    }
+    [System.Serializable]
+    public class BIOME_DATA
+    {
+        public float[,] tempNoiseMap; 
+        public float[,] humNoiseMap;
+        public Color[] colourTex;
+
+        public BIOME_DATA(int meshWidth, int meshHeight)
+        {
+            tempNoiseMap = new float[meshWidth + 1, meshHeight + 1];
+            humNoiseMap = new float[meshWidth + 1, meshHeight + 1];
+            colourTex = new Color[meshWidth * meshHeight];
+        }
+    }
+    [System.Serializable]
+    public class MESH_DATA
+    {
+        public Vector3[] Vertices;
+        public int[] Triangles;
+        public Vector2[] UVs;
+
+        public MESH_DATA(int meshWidth, int meshHeight)
+        {
+            Vertices = new Vector3[(meshWidth + 1) * (meshHeight + 1)];
+            UVs = new Vector2[(meshWidth + 1) * (meshHeight + 1)];
+            Triangles = new int[meshWidth * meshHeight * 6];
+        }
+    }
+}
