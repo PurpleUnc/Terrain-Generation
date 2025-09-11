@@ -1,0 +1,439 @@
+using UnityEngine;
+using System.Collections;
+using System;
+using System.Threading;
+using System.Collections.Generic;
+
+[RequireComponent(typeof(MeshFilter))]
+public class ProcedualGeneration : MonoBehaviour
+{
+    public enum DrawMode { NoiseMap, ColourMap, Mesh, FalloffMap };
+    public NormalizeMode normalizeMode;
+
+    [Header("MODE")]
+    [Space]
+    public DrawMode drawMode;
+    public bool useFalloff;
+    public bool autoUpdate;
+
+    [Space]
+
+    [Header("MESH")]
+    [Space]
+    public MeshCollider meshCollider;
+    public MeshFilter meshFilter;
+    public MeshRenderer meshRenderer;
+
+    [Header("MAP")]
+    [Space]
+    public TerrainType[] regions;
+    public Renderer textureRender;
+    [Space]
+    float[,] falloffMap;
+    public float falloffSteepness;
+    public float falloffOffset;
+    [Space]
+    public const int mapChunkSize = 240;
+    [Range(0, 6)]
+    public int levelOfDetail;
+    [Space]
+    public int seed;
+    public float meshHeightMultiplier;
+    public AnimationCurve meshHeightCurve;
+
+    [Space]
+
+    [Header("NOISE")]
+    [Space]
+    public Vector2 Noiseoffset;
+    [Space]
+    public float lacunarity;
+    [Range(0, 1)]
+    public float persistance;
+    public int octaves;
+    [Space]
+    public float scale;
+
+    [Space]
+
+    [Header("INF-GENERATION")]
+    public static Dictionary<Vector2Int, float[,]> WorldData;
+    public static Dictionary<Vector2Int, GameObject> ActiveChunks;
+    public static Dictionary<Vector2Int, Color[]> TextureData;
+
+    void Awake()
+    {
+        falloffMap = GenerateFalloffMap(mapChunkSize, falloffSteepness, falloffOffset);
+    }
+
+    void Start()
+    {
+        WorldData = new Dictionary<Vector2Int, float[,]>();
+        TextureData = new Dictionary<Vector2Int, Color[]>();
+        ActiveChunks = new Dictionary<Vector2Int, GameObject>();
+
+        for(int x = -2; x < 2; x++)
+        {
+            for (int y = -2; y < 2; y++)
+            {
+                CreateChunk(new Vector2Int(x, y));
+            }
+        }
+    }
+
+    public void CreateChunk(Vector2Int ChunkCoord)
+    {
+        Vector2Int pos = new Vector2Int(ChunkCoord.x * mapChunkSize, ChunkCoord.y * mapChunkSize);
+        mapData _mapData = GenerateMapData(pos);
+
+        float[,] WorldDataToApply = WorldData.ContainsKey(pos) ? WorldData[pos] : _mapData.heightMap;
+        Color[] TextureDataToApply = TextureData.ContainsKey(pos) ? TextureData[pos] : _mapData.colourMap;
+
+        meshData _meshData = MeshGen(WorldDataToApply, meshHeightCurve, meshHeightMultiplier, levelOfDetail);
+
+        string chunkName = $"chunk {ChunkCoord.x} {ChunkCoord.y}";
+        GameObject newChunk = new GameObject(chunkName, new System.Type[]
+        {
+            typeof(MeshRenderer),
+            typeof(MeshFilter),
+            typeof(MeshCollider)
+        });
+
+        MeshRenderer newChunkRenderer = newChunk.GetComponent<MeshRenderer>();
+        MeshFilter newChunkFilter = newChunk.GetComponent<MeshFilter>();
+        MeshCollider collider = newChunk.GetComponent<MeshCollider>();
+
+        newChunk.tag = "Ground";
+
+        newChunk.transform.position = new Vector3(ChunkCoord.x * mapChunkSize * (mapChunkSize - 1), 0f, ChunkCoord.y * mapChunkSize * (mapChunkSize - 1));//currentcoord * chunksize(sqr) = transform position of newchunk
+
+        Texture2D texture = TextureFromColourMap(TextureDataToApply, mapChunkSize, mapChunkSize);
+        newChunkRenderer.material.mainTexture = texture;
+        newChunkRenderer.transform.localScale = new Vector3(texture.width, 1, texture.height);
+
+        newChunkFilter.sharedMesh = _meshData.CreateMesh();
+        collider.sharedMesh = _meshData.CreateMesh();
+
+        ActiveChunks.Add(ChunkCoord, newChunk);
+    }
+
+    public void DrawMapInEditor()
+    {
+        Vector2Int reset = new Vector2Int(0, 0);
+        WorldData.Remove(reset);
+        TextureData.Remove(reset);
+
+        Vector2Int pos = new Vector2Int(0, 0);
+        mapData _mapData = GenerateMapData(pos);
+
+        if (drawMode == DrawMode.NoiseMap)
+        {
+            DrawTexture(TextureFromHeightMap(_mapData.heightMap));
+        }
+        else if (drawMode == DrawMode.ColourMap)
+        {
+            DrawTexture(TextureFromColourMap(_mapData.colourMap, mapChunkSize, mapChunkSize));
+        }
+        else if (drawMode == DrawMode.Mesh)
+        {
+            DrawMesh(MeshGen(_mapData.heightMap, meshHeightCurve, meshHeightMultiplier, levelOfDetail), TextureFromColourMap(_mapData.colourMap, mapChunkSize, mapChunkSize));
+        }
+        else if (drawMode == DrawMode.FalloffMap)
+        {
+            DrawTexture(TextureFromHeightMap(GenerateFalloffMap(mapChunkSize, falloffSteepness, falloffOffset)));
+        }
+    }
+
+    mapData GenerateMapData(Vector2Int offest)
+    {
+        float[,] noiseMap = NoiseGen(offest, mapChunkSize, mapChunkSize, seed, scale, octaves, persistance, lacunarity, Noiseoffset, normalizeMode);
+
+        Color[] colourMap = new Color[mapChunkSize * mapChunkSize];
+        for (int y = 0; y < mapChunkSize; y++)
+        {
+            for (int x = 0; x < mapChunkSize; x++)
+            {
+                if (useFalloff)
+                {
+                    noiseMap[x, y] = Mathf.Clamp01(noiseMap[x, y] - falloffMap[x, y]);
+                }
+                float currentHeight = noiseMap[x, y];
+                for (int i = 0; i < regions.Length; i++)
+                {
+                    if (currentHeight >= regions[i].height)
+                    {
+                        colourMap[y * mapChunkSize + x] = regions[i].colour;
+                    }
+                    else
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+        WorldData.Add(offest, noiseMap);
+        TextureData.Add(offest, colourMap);
+        return new mapData(noiseMap, colourMap);
+    }
+
+    void OnValidate()
+    {
+        if (lacunarity < 1)
+        {
+            lacunarity = 1;
+        }
+        if (octaves < 0)
+        {
+            octaves = 0;
+        }
+
+        falloffMap = GenerateFalloffMap(mapChunkSize, falloffSteepness, falloffOffset);
+    }
+
+    public static meshData MeshGen(float[,] heightMap, AnimationCurve _heightCurve, float heightMultiplier, int levelOfDetail)
+    {
+        AnimationCurve heightCurve = new AnimationCurve(_heightCurve.keys);
+
+        int width = heightMap.GetLength(0);
+        int height = heightMap.GetLength(1);
+        float topLeftX = (width - 1) / -2f;
+        float topLeftZ = (height - 1) / 2f;
+
+        int meshSimplificationIncrement = (levelOfDetail == 0) ? 1 : levelOfDetail * 2;
+        int verticesPerLine = (width - 1) / meshSimplificationIncrement + 1;
+
+        meshData _meshData = new meshData(verticesPerLine, verticesPerLine);
+        int vertexIndex = 0;
+
+        for (int y = 0; y < height; y += meshSimplificationIncrement)
+        {
+            for (int x = 0; x < width; x += meshSimplificationIncrement)
+            {
+                _meshData.vertices[vertexIndex] = new Vector3(topLeftX + x, heightCurve.Evaluate(heightMap[x, y]) * heightMultiplier, topLeftZ - y);
+                _meshData.uvs[vertexIndex] = new Vector2(x / (float)width, y / (float)height);
+
+                if (x < width - meshSimplificationIncrement && y < height - meshSimplificationIncrement)
+                {
+                    _meshData.AddTriangle(vertexIndex, vertexIndex + verticesPerLine + 1, vertexIndex + verticesPerLine);
+                    _meshData.AddTriangle(vertexIndex + verticesPerLine + 1, vertexIndex, vertexIndex + 1);
+                }
+
+                vertexIndex++;
+            }
+        }
+
+        return _meshData;
+
+    }
+
+    public enum NormalizeMode { Local, Global };
+
+    public static float[,] NoiseGen(Vector2Int offest, int mapWidth, int mapHeight, int seed, float scale, int octaves, float persistance, float lacunarity, Vector2 Noiseoffset, NormalizeMode normalizeMode)
+    {
+        float[,] noiseMap = new float[mapWidth, mapHeight];
+
+        System.Random prng = new System.Random(seed);
+        Vector2[] octaveOffsets = new Vector2[octaves];
+        Vector2Int[] Mapoffest = new Vector2Int[octaves];
+
+        float maxPossibleHeight = 0;
+        float amplitude = 1;
+        float frequency = 1;
+
+        for (int i = 0; i < octaves; i++)
+        {
+            float offsetX = prng.Next(-100000, 100000) + Noiseoffset.x;
+            float offsetY = prng.Next(-100000, 100000) + Noiseoffset.y;
+            octaveOffsets[i] = new Vector2(offsetX, offsetY);
+
+            int _offsetX = prng.Next(-100000, 100000) + offest.x;
+            int _offsetY = prng.Next(-100000, 100000) + offest.y;
+            Mapoffest[i] = new Vector2Int(_offsetX, _offsetY);
+
+            maxPossibleHeight += amplitude;
+            amplitude *= persistance;
+        } 
+
+        if (scale <= 0)
+        {
+            scale = 0.0001f;
+        }
+
+        float maxLocalNoiseHeight = float.MinValue;
+        float minLocalNoiseHeight = float.MaxValue;
+
+        float halfWidth = mapWidth / 2f;
+        float halfHeight = mapHeight / 2f;
+
+
+        for (int y = 0; y < mapHeight; y++)
+        {
+            for (int x = 0; x < mapWidth; x++)
+            {
+                amplitude = 1;
+                frequency = 1;
+                float noiseHeight = 0;
+
+                for (int i = 0; i < octaves; i++)
+                {
+                    float sampleX = (x - halfWidth + octaveOffsets[i].x + Mapoffest[i].x) / scale * frequency;
+                    float sampleY = (y - halfHeight - octaveOffsets[i].y - Mapoffest[i].y) / scale * frequency;
+
+                    float perlinValue = Mathf.PerlinNoise(sampleX, sampleY) * 2 - 1;
+                    noiseHeight += perlinValue * amplitude;
+
+                    amplitude *= persistance;
+                    frequency *= lacunarity;
+                }
+
+                if (noiseHeight > maxLocalNoiseHeight)
+                {
+                    maxLocalNoiseHeight = noiseHeight;
+                }
+                else if (noiseHeight < minLocalNoiseHeight)
+                {
+                    minLocalNoiseHeight = noiseHeight;
+                }
+                noiseMap[x, y] = noiseHeight;
+
+                if(normalizeMode == NormalizeMode.Global)
+                {
+                    float normalizedHeight = (noiseMap[x, y] + 1) / (2f * maxPossibleHeight / 2.35f);
+                    noiseMap[x, y] = Mathf.Clamp(normalizedHeight, 0, int.MaxValue);
+                }
+            }
+        }
+
+        if (normalizeMode == NormalizeMode.Local)
+        {
+            for (int y = 0; y < mapHeight; y++)
+            {
+                for (int x = 0; x < mapWidth; x++)
+                {
+                    noiseMap[x, y] = Mathf.InverseLerp(minLocalNoiseHeight, maxLocalNoiseHeight, noiseMap[x, y]);
+                }
+            }
+        }
+        return noiseMap;
+    }
+
+    public static Texture2D TextureFromColourMap(Color[] colourMap, int width, int height) {
+		Texture2D texture = new Texture2D (width, height);
+		texture.filterMode = FilterMode.Point;
+		texture.wrapMode = TextureWrapMode.Clamp;
+		texture.SetPixels (colourMap);
+		texture.Apply ();
+		return texture;
+	}
+
+    public static Texture2D TextureFromHeightMap(float[,] heightMap)
+    {
+        int width = heightMap.GetLength(0);
+        int height = heightMap.GetLength(1);
+
+        Color[] colourMap = new Color[width * height];
+        for (int y = 0; y < height; y++)
+        {
+            for (int x = 0; x < width; x++)
+            {
+                colourMap[y * width + x] = Color.Lerp(Color.black, Color.white, heightMap[x, y]);
+            }
+        }
+
+        return TextureFromColourMap(colourMap, width, height);
+    }
+
+    public void DrawMesh(meshData _meshData, Texture2D texture)
+    {
+        meshFilter.sharedMesh = _meshData.CreateMesh();
+        meshCollider.sharedMesh = _meshData.CreateMesh();
+        meshRenderer.sharedMaterial.mainTexture = texture;
+    }
+
+    public void DrawTexture(Texture2D texture)
+    {
+        textureRender.sharedMaterial.mainTexture = texture;
+        textureRender.transform.localScale = new Vector3(texture.width, 1, texture.height);
+    }
+
+    public static float[,] GenerateFalloffMap(int size, float falloffSteepness, float falloffOffset)
+    {
+        float[,] map = new float[size, size];
+        for (int x = 0; x < size; x++)
+        {
+            for (int y = 0; y < size; y++)
+            {
+                float _x = x / (float)size * 2 - 1;
+                float _y = y / (float)size * 2 - 1;
+
+                float value = Mathf.Max(Mathf.Abs(_x), Mathf.Abs(_y));
+
+                map[x, y] = Evaluate(value, falloffSteepness, falloffOffset);
+            }
+        }
+        return map;
+    }
+    static float Evaluate(float value, float falloffSteepness, float falloffOffset)
+    {
+        float a = falloffSteepness;
+        float b = falloffOffset;
+
+        return Mathf.Pow(value, a) / (Mathf.Pow(value, a) + Mathf.Pow(b - b * value, a));
+    }
+}
+
+[System.Serializable]
+public struct terrainType
+{
+    public string name;
+    public float height;
+    public Color colour;
+}
+
+public struct mapData
+{
+    public readonly float[,] heightMap;
+    public readonly Color[] colourMap;
+
+    public mapData(float[,] heightMap, Color[] colourMap)
+    {
+        this.heightMap = heightMap;
+        this.colourMap = colourMap;
+    }
+}
+
+public class meshData
+{
+    public Vector3[] vertices;
+    public int[] triangles;
+    public Vector2[] uvs;
+
+    int triangleIndex;
+
+    public meshData(int meshWidth, int meshHeight)
+    {
+        vertices = new Vector3[meshWidth * meshHeight];
+        uvs = new Vector2[meshWidth * meshHeight];
+        triangles = new int[(meshWidth - 1) * (meshHeight - 1) * 6];
+    }
+
+    public void AddTriangle(int a, int b, int c)
+    {
+        triangles[triangleIndex] = a;
+        triangles[triangleIndex + 1] = b;
+        triangles[triangleIndex + 2] = c;
+        triangleIndex += 3;
+    }
+
+    public Mesh CreateMesh()
+    {
+        Mesh mesh = new Mesh();
+        mesh.vertices = vertices;
+        mesh.triangles = triangles;
+        mesh.uv = uvs;
+        mesh.RecalculateNormals();
+        return mesh;
+    }
+
+}
+
