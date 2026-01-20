@@ -1,0 +1,51 @@
+using System.Collections;
+using System.Collections.Generic;
+using UnityEngine;
+
+public class PlayerPositionRenderer : MonoBehaviour
+{
+    [SerializeField] private Transform Player;
+    [SerializeField] private int RenderDistance;
+    private MeshGeneration GenerationInstance;
+    private List<Vector2> CoordsToRemove;
+
+    // Start is called before the first frame update
+    void Start()
+    {
+        GenerationInstance = GetComponent<MeshGeneration>();
+        CoordsToRemove = new List<Vector2>();
+    }
+
+    // Update is called once per frame
+    void Update()
+    {
+        int PlrChunkX = (int)Player.position.x / 256; //256 is chunk size and has to be static
+        int PlrChunkY = (int)Player.position.y / 256; //256 is chunk size and has to be static
+        CoordsToRemove.Clear();
+
+        foreach (KeyValuePair<Vector2, GameObject> activateChunk in MeshGeneration.ActivateChunks)
+        {
+            CoordsToRemove.Add(activateChunk.Key);
+        }
+
+        for(int x = PlrChunkX - RenderDistance; x <= PlrChunkX + RenderDistance; x++)
+        {
+            for (int y = PlrChunkY - RenderDistance; y <= PlrChunkY + RenderDistance; y++)
+            {
+                Vector2 chunkCoord = new Vector2(x, y); ;
+                if (!MeshGeneration.ActivateChunks.ContainsKey(chunkCoord))
+                {
+                    GenerationInstance.CreateChunk(chunkCoord);
+                }
+                CoordsToRemove.Remove(chunkCoord);
+            }
+        }
+
+        foreach(Vector2 coord in CoordsToRemove)
+        {
+            GameObject chunkToDelete = MeshGeneration.ActivateChunks[coord];
+            MeshGeneration.ActivateChunks.Remove(coord);
+            Destroy(chunkToDelete);
+        }
+    }
+}
